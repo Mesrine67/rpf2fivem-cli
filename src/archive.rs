@@ -23,25 +23,74 @@ pub fn extract(archive_path: &Path, output_dir: &Path) -> Result<Vec<PathBuf>> {
     }
 }
 
+// Limits are conservative until FXMP has real-world archive fixtures.
+const MAX_ZIP_ENTRIES: usize = 10_000;
+const MAX_ZIP_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_ZIP_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 fn extract_zip(archive_path: &Path, output_dir: &Path) -> Result<Vec<PathBuf>> {
     let file = fs::File::open(archive_path)
         .with_context(|| format!("Cannot open zip: {}", archive_path.display()))?;
     let mut archive = zip::ZipArchive::new(file)?;
+    if archive.len() > MAX_ZIP_ENTRIES {
+        bail!("ZIP contains too many entries: {}", archive.len());
+    }
+    let root = fs::canonicalize(output_dir)?;
     let mut extracted = Vec::new();
+    let mut total_bytes = 0_u64;
 
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
+        let name = entry.name().to_owned();
+        // A ZIP member is untrusted, even when the archive was downloaded
+        // from a well-known site. Do not allow absolute or traversing paths.
+        let relative = entry
+            .enclosed_name()
+            .ok_or_else(|| anyhow::anyhow!("Unsafe ZIP entry path: {name:?}"))?
+            .to_path_buf();
+        if relative.as_os_str().is_empty() {
+            bail!("Empty ZIP entry path");
+        }
+        if entry
+            .unix_mode()
+            .is_some_and(|mode| mode & 0o170000 == 0o120000)
+        {
+            bail!("ZIP symbolic links are not supported: {name:?}");
+        }
         if entry.is_dir() {
             continue;
         }
-        let name = entry.name().to_string();
-        let out_path = output_dir.join(&name);
-        if let Some(parent) = out_path.parent() {
-            fs::create_dir_all(parent)?;
+        if entry.size() > MAX_ZIP_ENTRY_BYTES
+            || entry.size() > MAX_ZIP_TOTAL_BYTES.saturating_sub(total_bytes)
+        {
+            bail!("ZIP entry exceeds extraction budget: {name:?}");
         }
-        let mut data = Vec::new();
-        entry.read_to_end(&mut data)?;
-        fs::write(&out_path, &data)?;
+
+        let out_path = output_dir.join(&relative);
+        let parent = out_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Invalid ZIP destination"))?;
+        fs::create_dir_all(parent)?;
+        if !fs::canonicalize(parent)?.starts_with(&root) {
+            bail!("ZIP entry escapes the extraction directory: {name:?}");
+        }
+
+        // Stream into an isolated temporary file; never load an unbounded
+        // decompressed entry into memory or overwrite an existing destination.
+        let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+        let copied = std::io::copy(&mut (&mut entry).take(MAX_ZIP_ENTRY_BYTES + 1), &mut temp)?;
+        total_bytes = total_bytes
+            .checked_add(copied)
+            .ok_or_else(|| anyhow::anyhow!("ZIP extraction byte counter overflow"))?;
+        if copied > MAX_ZIP_ENTRY_BYTES || total_bytes > MAX_ZIP_TOTAL_BYTES {
+            bail!("ZIP decompressed data exceeds extraction budget: {name:?}");
+        }
+        temp.persist_noclobber(&out_path).with_context(|| {
+            format!(
+                "Cannot safely create ZIP destination: {}",
+                out_path.display()
+            )
+        })?;
         extracted.push(out_path);
     }
 
@@ -137,7 +186,9 @@ pub fn download(url: &str, cache_dir: &Path) -> Result<PathBuf> {
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         .build()?;
 
-    let response = client.get(url).send()
+    let response = client
+        .get(url)
+        .send()
         .with_context(|| format!("HTTP request failed: {}", url))?;
 
     if !response.status().is_success() {
@@ -161,7 +212,10 @@ pub fn download(url: &str, cache_dir: &Path) -> Result<PathBuf> {
     let bytes = response.bytes()?;
 
     // Detect an HTML error page served instead of the actual file
-    if bytes.starts_with(b"<!DOCTYPE") || bytes.starts_with(b"<!doctype") || bytes.starts_with(b"<html") {
+    if bytes.starts_with(b"<!DOCTYPE")
+        || bytes.starts_with(b"<!doctype")
+        || bytes.starts_with(b"<html")
+    {
         bail!(
             "Received an HTML page instead of a file download.\n\
              The site may require browser interaction or the link has expired.\n\
@@ -171,7 +225,11 @@ pub fn download(url: &str, cache_dir: &Path) -> Result<PathBuf> {
 
     let dest = cache_dir.join(&filename);
     fs::write(&dest, &bytes)?;
-    eprintln!("[Download] Saved {} bytes to {}", bytes.len(), dest.display());
+    eprintln!(
+        "[Download] Saved {} bytes to {}",
+        bytes.len(),
+        dest.display()
+    );
     Ok(dest)
 }
 
@@ -196,4 +254,61 @@ fn filename_from_content_disposition(header: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn fixture_zip(zip_path: &Path, members: &[(&str, &[u8])]) {
+        let file = fs::File::create(zip_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        for &(name, content) in members {
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(content).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn zip_extracts_nested_files_under_the_selected_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("test.zip");
+        let dest = dir.path().join("out");
+        fixture_zip(
+            &archive,
+            &[
+                ("stream/car.yft", b"model"),
+                ("data/handling.meta", b"meta"),
+            ],
+        );
+        let paths = extract(&archive, &dest).unwrap();
+        assert_eq!(paths.len(), 2);
+        assert_eq!(fs::read(dest.join("stream/car.yft")).unwrap(), b"model");
+        assert_eq!(fs::read(dest.join("data/handling.meta")).unwrap(), b"meta");
+    }
+
+    #[test]
+    fn zip_rejects_parent_traversal_without_writing_outside_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("bad.zip");
+        let dest = dir.path().join("out");
+        fixture_zip(&archive, &[("../outside.txt", b"escape")]);
+        assert!(extract(&archive, &dest).is_err());
+        assert!(!dir.path().join("outside.txt").exists());
+    }
+
+    #[test]
+    fn zip_never_overwrites_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("test.zip");
+        let dest = dir.path().join("out");
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(dest.join("file.txt"), b"original").unwrap();
+        fixture_zip(&archive, &[("file.txt", b"overwrite")]);
+        assert!(extract(&archive, &dest).is_err());
+        assert_eq!(fs::read(dest.join("file.txt")).unwrap(), b"original");
+    }
 }
