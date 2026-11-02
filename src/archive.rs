@@ -179,14 +179,44 @@ fn collect_by_ext(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
 /// Download a file from a URL into cache_dir, returning the saved path.
 /// The filename is taken from the Content-Disposition header if available,
 /// otherwise inferred from the URL's last path segment.
+// A network request must never read an unbounded response into process memory.
+const MAX_DOWNLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+fn safe_download_filename(raw: &str) -> Option<String> {
+    // The HTTP header is untrusted. Accept a basename only (both slash styles
+    // matter on Windows), with a conservative portable character set.
+    let basename = raw.rsplit(&['/', '\\'][..]).next()?;
+    let basename = basename.split(['?', '#']).next()?.trim();
+    if basename.is_empty() || basename == "." || basename == ".." {
+        return None;
+    }
+    let clean: String = basename
+        .chars()
+        .take(128)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if clean.trim_matches(['.', '_']).is_empty() {
+        return None;
+    }
+    Some(clean)
+}
+
 pub fn download(url: &str, cache_dir: &Path) -> Result<PathBuf> {
     eprintln!("[Download] Fetching {}...", url);
+    fs::create_dir_all(cache_dir)?;
 
     let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(180))
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         .build()?;
 
-    let response = client
+    let mut response = client
         .get(url)
         .send()
         .with_context(|| format!("HTTP request failed: {}", url))?;
@@ -194,42 +224,60 @@ pub fn download(url: &str, cache_dir: &Path) -> Result<PathBuf> {
     if !response.status().is_success() {
         bail!("HTTP {} for {}", response.status(), url);
     }
+    if response
+        .content_length()
+        .is_some_and(|bytes| bytes > MAX_DOWNLOAD_BYTES)
+    {
+        bail!("Download exceeds the permitted size");
+    }
 
-    // Prefer filename from Content-Disposition, fall back to URL segment
     let filename = response
         .headers()
         .get("content-disposition")
         .and_then(|v| v.to_str().ok())
         .and_then(filename_from_content_disposition)
+        .as_deref()
+        .and_then(safe_download_filename)
         .or_else(|| {
-            url.split('/')
-                .last()
-                .filter(|s| !s.is_empty() && s.contains('.'))
-                .map(|s| s.to_string())
+            response
+                .url()
+                .path_segments()
+                .and_then(|segments| segments.last())
+                .and_then(safe_download_filename)
         })
         .unwrap_or_else(|| "download.zip".to_string());
 
-    let bytes = response.bytes()?;
-
-    // Detect an HTML error page served instead of the actual file
-    if bytes.starts_with(b"<!DOCTYPE")
-        || bytes.starts_with(b"<!doctype")
-        || bytes.starts_with(b"<html")
+    // Check the first bytes before creating a visible output. Stream to a
+    // temporary file and commit only if the entire bounded download succeeds.
+    let mut initial = [0u8; 64];
+    let first_len = response.read(&mut initial)?;
+    let prefix = &initial[..first_len];
+    if prefix.starts_with(b"<!DOCTYPE")
+        || prefix.starts_with(b"<!doctype")
+        || prefix.starts_with(b"<html")
     {
-        bail!(
-            "Received an HTML page instead of a file download.\n\
-             The site may require browser interaction or the link has expired.\n\
-             Try downloading the file manually and pass the local path instead."
-        );
+        bail!("Received HTML instead of a file; download it manually.");
+    }
+    let mut temp = tempfile::NamedTempFile::new_in(cache_dir)?;
+    use std::io::Write;
+    temp.write_all(prefix)?;
+    let copied = std::io::copy(
+        &mut response.take(MAX_DOWNLOAD_BYTES + 1 - first_len as u64),
+        &mut temp,
+    )?;
+    let total = copied + first_len as u64;
+    if total > MAX_DOWNLOAD_BYTES {
+        bail!("Downloaded content exceeds the permitted size");
     }
 
-    let dest = cache_dir.join(&filename);
-    fs::write(&dest, &bytes)?;
-    eprintln!(
-        "[Download] Saved {} bytes to {}",
-        bytes.len(),
-        dest.display()
-    );
+    let dest = cache_dir.join(filename);
+    temp.persist_noclobber(&dest).with_context(|| {
+        format!(
+            "Cannot create download without overwriting: {}",
+            dest.display()
+        )
+    })?;
+    eprintln!("[Download] Saved {} bytes to {}", total, dest.display());
     Ok(dest)
 }
 
@@ -298,6 +346,29 @@ mod tests {
         fixture_zip(&archive, &[("../outside.txt", b"escape")]);
         assert!(extract(&archive, &dest).is_err());
         assert!(!dir.path().join("outside.txt").exists());
+    }
+
+    #[test]
+    fn download_names_cannot_escape_cache_directory() {
+        assert_eq!(
+            safe_download_filename("../../etc/passwd"),
+            Some("passwd".into())
+        );
+        assert_eq!(
+            safe_download_filename(r"..\\..\\secret.zip"),
+            Some("secret.zip".into())
+        );
+        assert_eq!(
+            safe_download_filename("archive.zip?token=sensitive"),
+            Some("archive.zip".into())
+        );
+        assert_eq!(
+            safe_download_filename("name:bad?.zip"),
+            Some("name_bad".into())
+        );
+        assert_eq!(safe_download_filename(".."), None);
+        assert_eq!(safe_download_filename("."), None);
+        assert_eq!(safe_download_filename(""), None);
     }
 
     #[test]
